@@ -20,8 +20,8 @@
 #
 set -uo pipefail
 
-REPO_URL="${MOTOCAM_URL:-https://github.com/tiraq-official/vendor_motorola_motocam.git}"
-BRANCH="${MOTOCAM_BRANCH:-test}"
+REPO_URL="${MOTOCAM_URL:-https://github.com/fogos-5-4/vendor_motorola_motocam.git}"
+BRANCH="${MOTOCAM_BRANCH:-fogos}"
 DEVICE="${MOTOCAM_DEVICE:-fogos}"
 ROM_ROOT="${ANDROID_BUILD_TOP:-}"
 SKIP_LFS=0
@@ -32,19 +32,111 @@ APK_REL="proprietary/product/priv-app/MotCamera4/MotCamera4.apk"
 APK_MIN_BYTES=100000000
 PATCHER="patch_cameraserver_shutter.py"
 
-c_ok()   { printf '\033[1;32m  ok  \033[0m%s\n' "$*"; }
-c_info() { printf '\033[1;34m  ..  \033[0m%s\n' "$*"; }
-c_warn() { printf '\033[1;33m warn \033[0m%s\n' "$*"; }
-c_err()  { printf '\033[1;31m fail \033[0m%s\n' "$*" >&2; }
-die()    { c_err "$*"; exit 1; }
-step()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+# ---------------------------------------------------------------------------
+# presentation
+# ---------------------------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+    RST=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+    CY=$'\033[36m'; MG=$'\033[35m'; GR=$'\033[32m'; YL=$'\033[33m'; RD=$'\033[31m'
+    TTY=1
+else
+    RST=; BOLD=; DIM=; CY=; MG=; GR=; YL=; RD=; TTY=0
+fi
+
+# box drawing and spinner glyphs only when the locale can render them
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*)
+        FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+        G_OK="✓"; G_NO="✗"; G_WARN="!"; G_DOT="·"; G_STEP="▸"
+        RULE="────────────────────────────────────────────────────────────" ;;
+    *)
+        FRAMES=( '|' '/' '-' '\' )
+        G_OK="+"; G_NO="x"; G_WARN="!"; G_DOT="-"; G_STEP=">"
+        RULE="------------------------------------------------------------" ;;
+esac
+
+banner() {
+    printf '\n'
+    printf '%s' "$MG"
+    printf '%s\n' ' __  __    ___    _____    ___     ___     _     __  __ '
+    printf '%s\n' '|  \/  |  / _ \  |_   _|  / _ \   / __|   /_\   |  \/  |'
+    printf '%s' "$CY"
+    printf '%s\n' '| |\/| | | (_) |   | |   | (_) | | (__   / _ \  | |\/| |'
+    printf '%s\n' '|_|  |_|  \___/    |_|    \___/   \___| /_/ \_\_|  |_|'
+    printf '%s' "$RST"
+    printf '   %sMotorola Camera 4 — drop-in installer%s\n' "$DIM" "$RST"
+    printf '   %sdevice %s · branch %s%s\n' "$DIM" "$DEVICE" "$BRANCH" "$RST"
+    printf '   %s%s%s\n' "$DIM" "$RULE" "$RST"
+}
+
+c_ok()   { printf '   %s%s%s %s\n' "$GR" "$G_OK" "$RST" "$*"; }
+c_info() { printf '   %s%s%s %s\n' "$DIM" "$G_DOT" "$RST" "$*"; }
+c_warn() { printf '   %s%s%s %s\n' "$YL" "$G_WARN" "$RST" "$*"; }
+c_err()  { printf '   %s%s%s %s\n' "$RD" "$G_NO" "$RST" "$*" >&2; }
+die()    { printf '\n' >&2; c_err "$*"; printf '\n' >&2; exit 1; }
+
+step() {
+    local raw="$*" n t
+    if [ "$raw" != "${raw%% *}" ]; then
+        n="${raw%% *}"
+        t="${raw#* }"
+        t="${t#"${t%%[![:space:]]*}"}"
+        printf '\n%s%s%s %s[%s]%s %s%s%s\n' "$MG" "$G_STEP" "$RST" "$DIM" "$n" "$RST" "$BOLD" "$t" "$RST"
+    else
+        printf '\n%s%s%s %s%s%s\n' "$MG" "$G_STEP" "$RST" "$BOLD" "$raw" "$RST"
+    fi
+}
+
+# spin "label" cmd...   -- quiet command with a live spinner
+spin() {
+    local msg="$1"; shift
+    local out rc pid i=0
+    out=$(mktemp 2>/dev/null) || out="/tmp/motocam.$$"
+    "$@" >"$out" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$TTY" -eq 1 ]; then
+            printf '\r   %s%s%s %s' "$CY" "${FRAMES[$((i % ${#FRAMES[@]}))]}" "$RST" "$msg"
+            i=$((i + 1))
+        fi
+        sleep 0.1
+    done
+    wait "$pid"; rc=$?
+    [ "$TTY" -eq 1 ] && printf '\r\033[K'
+    if [ $rc -ne 0 ]; then
+        c_err "$msg — failed"
+        sed 's/^/     /' "$out" | tail -15 >&2
+    fi
+    rm -f "$out"
+    return $rc
+}
+
+# run_visible "label" cmd...  -- lets the command draw its own progress bar
+run_visible() {
+    local msg="$1"; shift
+    local start rc
+    start=$(date +%s)
+    [ "$TTY" -eq 1 ] && printf '   %s%s%s %s\n' "$DIM" "$G_DOT" "$RST" "$msg"
+    "$@"; rc=$?
+    if [ $rc -eq 0 ]; then
+        c_ok "$msg — done in $(( $(date +%s) - start ))s"
+    else
+        c_err "$msg — failed after $(( $(date +%s) - start ))s"
+    fi
+    return $rc
+}
+
+kv()   { printf '   %s%-14s%s %s\n' "$DIM" "$1" "$RST" "$2"; }
+hdr()  { printf '\n%s%s%s\n' "$BOLD" "$*" "$RST"; }
+cmd()  { printf '   %s$ %s%s\n' "$DIM" "$*" "$RST"; }
+note() { printf '   %s%s%s\n' "$DIM" "$*" "$RST"; }
 
 usage() {
     sed -n '2,20p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true
     cat <<'EOF'
 Options:
   -r, --root DIR      ROM source root (default: $ANDROID_BUILD_TOP, else cwd)
-  -b, --branch NAME   camera repo branch (default: test)
+  -b, --branch NAME   camera repo branch (default: fogos)
   -d, --device NAME   device codename (default: fogos)
       --skip-lfs      do not check/pull git-lfs (use only if the APK is already real)
       --no-patch      skip the cameraserver shutter-order patch
@@ -67,7 +159,8 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------------------
-step "1/6  checking the ROM tree"
+banner
+step "1/7  checking the ROM tree"
 # ---------------------------------------------------------------------------
 [ -n "$ROM_ROOT" ] || ROM_ROOT="$PWD"
 ROM_ROOT="$(cd "$ROM_ROOT" 2>/dev/null && pwd)" || die "cannot enter ROM root: ${ROM_ROOT:-<empty>}"
@@ -92,7 +185,7 @@ done
 c_ok "git and python3 present"
 
 # ---------------------------------------------------------------------------
-step "2/6  checking git-lfs"
+step "2/7  checking git-lfs"
 # ---------------------------------------------------------------------------
 if [ "$SKIP_LFS" -eq 1 ]; then
     c_warn "--skip-lfs given, not checking git-lfs"
@@ -119,30 +212,34 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "3/6  camera repo -> $CAM_DIR (branch $BRANCH)"
+step "3/7  camera repo -> $CAM_DIR (branch $BRANCH)"
 # ---------------------------------------------------------------------------
-if [ -d "$CAM_DIR/.git" ]; then
-    c_info "already cloned, updating"
-    git -C "$CAM_DIR" fetch --all --prune >/dev/null 2>&1 || c_warn "git fetch failed (offline?)"
-    if [ -n "$(git -C "$CAM_DIR" status --porcelain 2>/dev/null)" ]; then
-        c_warn "working tree has local changes -- leaving it alone"
-    else
-        git -C "$CAM_DIR" checkout "$BRANCH" >/dev/null 2>&1 || c_warn "branch $BRANCH not found, staying on current"
-        git -C "$CAM_DIR" pull --ff-only >/dev/null 2>&1 || c_warn "could not fast-forward"
-    fi
-else
-    mkdir -p "$(dirname "$CAM_DIR")"
-    git clone --branch "$BRANCH" "$REPO_URL" "$CAM_DIR" || die "clone failed"
+if [ -e "$CAM_DIR" ]; then
+    c_warn "$CAM_DIR already exists -- stopping, nothing was changed."
+    cat <<EOF
+
+  If you really want a fresh install, remove it first and re-run:
+
+    rm -rf $CAM_DIR
+    curl -LSs <url> | bash
+
+  If it is already installed and working, you do not need this script.
+EOF
+    exit 0
 fi
+mkdir -p "$(dirname "$CAM_DIR")"
+run_visible "Cloning camera repo ($BRANCH)" \
+        git clone --branch "$BRANCH" "$REPO_URL" "$CAM_DIR" || die "clone failed"
 c_ok "repo at $(git -C "$CAM_DIR" rev-parse --short HEAD) ($(git -C "$CAM_DIR" rev-parse --abbrev-ref HEAD))"
 
 # ---------------------------------------------------------------------------
-step "4/6  pulling the LFS objects"
+step "4/7  pulling the LFS objects"
 # ---------------------------------------------------------------------------
 if [ "$SKIP_LFS" -eq 0 ]; then
     git -C "$CAM_DIR" lfs install --local >/dev/null 2>&1 || c_warn "git lfs install --local failed"
     c_info "downloading LFS objects (the APK is ~238 MB, this takes a while)"
-    git -C "$CAM_DIR" lfs pull || die "git lfs pull failed"
+    run_visible "Downloading LFS objects (the APK is ~238 MB)" \
+        git -C "$CAM_DIR" lfs pull || die "git lfs pull failed"
 fi
 
 APK="$CAM_DIR/$APK_REL"
@@ -158,7 +255,227 @@ fi
 c_ok "MotCamera4.apk is $((APK_SIZE / 1024 / 1024)) MB (real file)"
 
 # ---------------------------------------------------------------------------
-step "5/6  wiring the camera into device/motorola/$DEVICE"
+step "5/7  camera / Dolby overlap"
+# ---------------------------------------------------------------------------
+cat > "$CAM_DIR/resolve_dolby_overlap.py" <<'PYDOLBYEOF'
+#!/usr/bin/env python3
+"""
+resolve_dolby_overlap.py -- stop the camera tree and the Dolby tree from
+installing the same two things.
+
+hardware/dolby now ships (commits d517904, 4b31e2e):
+  * a MotorolaSettingsProvider android_app_import module + PRODUCT_PACKAGES entry
+  * moto-settings.jar copied to /system/framework/moto-settings.jar
+  * moto-settings.xml copied to /system/etc/permissions/moto-settings.xml
+
+vendor/motorola/motocamera ships the same three things, so with both trees in
+the build you get:
+  * "module MotorolaSettingsProvider already defined"        (two Android.bp)
+  * overriding commands for /system/framework/moto-settings.jar
+  * duplicate PRODUCT_COPY_FILES destination for moto-settings.xml
+
+Dolby is the always-present tree and the camera is optional, so the camera
+defers: this removes its copies. The jar, the permission XML and the provider
+still land on the device -- from Dolby.
+
+Everything else the camera needs (moto-core_services, com.motorola.motosignature,
+their XMLs) is untouched, because Dolby does not ship those.
+
+Usage: resolve_dolby_overlap.py <camera_repo_dir> <rom_root>
+Exit:  0 nothing to do / resolved,  1 could not resolve (build would break)
+"""
+
+import os
+import re
+import sys
+
+# module names the camera tree must drop when Dolby is present
+DROP_MODULES = {"MotorolaSettingsProvider", "moto-settings"}
+# PRODUCT_PACKAGES entries to drop
+DROP_PACKAGES = {"MotorolaSettingsProvider", "moto-settings"}
+# PRODUCT_COPY_FILES entries to drop (matched on the source path fragment)
+DROP_COPY = ["system/etc/permissions/moto-settings.xml"]
+
+
+def bp_blocks(text):
+    """Yield (start, end, block_text) for every top-level {...} module block."""
+    i = 0
+    while i < len(text):
+        brace = text.find("{", i)
+        if brace < 0:
+            return
+        # walk back to the module type / name line
+        line_start = text.rfind("\n", 0, brace) + 1
+        start = line_start
+        depth = 0
+        j = brace
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        end = j
+        # extend to end of line
+        nl = text.find("\n", end)
+        end = len(text) if nl < 0 else nl + 1
+        yield start, end, text[start:end]
+        i = end
+
+
+def drop_modules(bp_path):
+    text = open(bp_path, encoding="utf-8").read()
+    removed = []
+    out = []
+    last = 0
+    for start, end, block in bp_blocks(text):
+        m = re.search(r'name:\s*"([^"]+)"', block)
+        if m and m.group(1) in DROP_MODULES:
+            out.append(text[last:start])
+            last = end
+            removed.append(m.group(1))
+    if removed:
+        out.append(text[last:])
+        open(bp_path, "w", encoding="utf-8").write("".join(out))
+    return removed
+
+
+def drop_package_lines(mk_path):
+    lines = open(mk_path, encoding="utf-8").read().splitlines(keepends=True)
+    out = []
+    removed = []
+    for line in lines:
+        stripped = line.strip().rstrip("\\").strip()
+        if stripped in DROP_PACKAGES:
+            removed.append(stripped)
+            # if this was the last line of a continuation block, the previous
+            # line must lose its trailing backslash
+            if not line.rstrip("\n").rstrip().endswith("\\") and out:
+                prev = out[-1]
+                out[-1] = prev.rstrip("\n").rstrip()
+                if out[-1].endswith("\\"):
+                    out[-1] = out[-1][:-1].rstrip()
+                out[-1] += "\n"
+            continue
+        out.append(line)
+    if removed:
+        open(mk_path, "w", encoding="utf-8").write("".join(out))
+    return removed
+
+
+def drop_copy_lines(mk_path):
+    lines = open(mk_path, encoding="utf-8").read().splitlines(keepends=True)
+    out = []
+    removed = []
+    for line in lines:
+        if any(frag in line for frag in DROP_COPY):
+            removed.append(line.strip())
+            if not line.rstrip("\n").rstrip().endswith("\\") and out:
+                prev = out[-1]
+                out[-1] = prev.rstrip("\n").rstrip()
+                if out[-1].endswith("\\"):
+                    out[-1] = out[-1][:-1].rstrip()
+                out[-1] += "\n"
+            continue
+        out.append(line)
+    if removed:
+        open(mk_path, "w", encoding="utf-8").write("".join(out))
+    return removed
+
+
+def dolby_ships_the_dupes(rom_root):
+    """True if the Dolby tree in this ROM provides the provider + jar + xml."""
+    for mk in ("hardware/dolby/dolby.mk",):
+        path = os.path.join(rom_root, mk)
+        if not os.path.isfile(path):
+            continue
+        txt = open(path, encoding="utf-8", errors="surrogateescape").read()
+        has_provider = "MotorolaSettingsProvider" in txt
+        has_jar = "moto-settings.jar" in txt
+        if has_provider and has_jar:
+            return True, path, (has_provider, has_jar)
+        return False, path, (has_provider, has_jar)
+    return False, None, (False, False)
+
+
+def main():
+    if len(sys.argv) < 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    cam = sys.argv[1]
+    rom = sys.argv[2]
+
+    bp = os.path.join(cam, "Android.bp")
+    mk = os.path.join(cam, "motocamera.mk")
+    for p in (bp, mk):
+        if not os.path.isfile(p):
+            print(f"[SKIP] {p} not found -- nothing to resolve", file=sys.stderr)
+            return 0
+
+    present, dolby_mk, flags = dolby_ships_the_dupes(rom)
+    if dolby_mk is None:
+        print("[SKIP] no hardware/dolby in this tree -- nothing to resolve", file=sys.stderr)
+        return 0
+    if not present:
+        print(f"[SKIP] {os.path.relpath(dolby_mk, rom)} does not ship the overlapping files "
+              f"(provider={flags[0]}, jar={flags[1]}) -- leaving the camera tree alone",
+              file=sys.stderr)
+        return 0
+
+    mods = drop_modules(bp)
+    pkgs = drop_package_lines(mk)
+    copies = drop_copy_lines(mk)
+
+    for m in mods:
+        print(f"[PASS] removed Android.bp module {m}", file=sys.stderr)
+    for p in pkgs:
+        print(f"[PASS] removed {p} from PRODUCT_PACKAGES", file=sys.stderr)
+    for c in copies:
+        print(f"[PASS] removed copy of {c.split(':')[0]}", file=sys.stderr)
+
+    # verify the overlap is actually gone
+    txt_bp = open(bp, encoding="utf-8").read()
+    txt_mk = open(mk, encoding="utf-8").read()
+    problems = []
+    for name in DROP_MODULES:
+        if re.search(r'name:\s*"%s"' % re.escape(name), txt_bp):
+            problems.append(f"Android.bp still defines {name}")
+    for name in DROP_PACKAGES:
+        if re.search(r"^\s*%s\s*\\?\s*$" % re.escape(name), txt_mk, re.M):
+            problems.append(f"motocamera.mk still lists {name} in PRODUCT_PACKAGES")
+    for frag in DROP_COPY:
+        if frag in txt_mk:
+            problems.append(f"motocamera.mk still copies {frag}")
+
+    if problems:
+        for p in problems:
+            print(f"[FAIL] {p}", file=sys.stderr)
+        return 1
+
+    print("[PASS] camera tree now defers to hardware/dolby for "
+          "MotorolaSettingsProvider + moto-settings", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PYDOLBYEOF
+chmod +x "$CAM_DIR/resolve_dolby_overlap.py"
+
+# hardware/dolby now ships MotorolaSettingsProvider + moto-settings.jar itself,
+# so the camera tree must not install them again (duplicate module name,
+# duplicate /system/framework/moto-settings.jar, duplicate permission XML).
+if python3 "$CAM_DIR/resolve_dolby_overlap.py" "$CAM_DIR" "$ROM_ROOT" 2>&1 | sed 's/^/     /'; then
+    c_ok "overlap resolved"
+else
+    die "could not resolve the camera/Dolby overlap -- the build would fail on a duplicate module"
+fi
+
+# ---------------------------------------------------------------------------
+step "6/7  wiring the camera into device/motorola/$DEVICE"
 # ---------------------------------------------------------------------------
 DEV_MK="device/motorola/$DEVICE/device.mk"
 if [ ! -f "$DEV_MK" ]; then
@@ -177,7 +494,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "6/6  cameraserver shutter-order patch"
+step "7/7  cameraserver shutter-order patch"
 # ---------------------------------------------------------------------------
 if [ "$DO_PATCH" -eq 0 ]; then
     c_warn "--no-patch given, skipping"
@@ -379,7 +696,7 @@ PYEOF
     fi
 
     c_info "applying now"
-    if python3 "$CAM_DIR/$PATCHER" "$ROM_ROOT"; then
+    if python3 "$CAM_DIR/$PATCHER" "$ROM_ROOT" 2>&1 | sed 's/^/     /'; then
         c_ok "cameraserver patched"
     else
         die "could not patch cameraserver -- see the message above"
@@ -387,39 +704,39 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------------------
-step "summary"
+step "done"
 # ---------------------------------------------------------------------------
-printf '  camera repo : %s (%s @ %s)\n' "$CAM_DIR" \
-    "$(git -C "$CAM_DIR" rev-parse --abbrev-ref HEAD)" "$(git -C "$CAM_DIR" rev-parse --short HEAD)"
-printf '  APK         : %s MB\n' "$((APK_SIZE / 1024 / 1024))"
-printf '  device.mk   : %s\n' "$DEV_MK"
-[ "$DO_PATCH" -eq 1 ] && printf '  cameraserver: patched at build time via motocamera.mk\n'
+printf '   %s%s%s\n' "$DIM" "$RULE" "$RST"
+kv "camera repo" "$CAM_DIR ($(git -C "$CAM_DIR" rev-parse --abbrev-ref HEAD) @ $(git -C "$CAM_DIR" rev-parse --short HEAD))"
+kv "APK" "$((APK_SIZE / 1024 / 1024)) MB — real file, not an LFS pointer"
+kv "device tree" "$DEV_MK"
+[ "$DO_PATCH" -eq 1 ] && kv "cameraserver" "patched at build time via motocamera.mk"
+[ -d hardware/dolby ] && kv "dolby" "camera defers to hardware/dolby"
+printf '   %s%s%s\n' "$DIM" "$RULE" "$RST"
 
 if [ -f "vendor/motorola/fogos/proprietary/vendor/lib64/libgui_vendor.so" ]; then
     c_ok "libgui_vendor.so present in the vendor repo"
 else
     c_warn "libgui_vendor.so NOT found in vendor/motorola/fogos"
-    printf '        the V1UGS35M camera HAL needs it or camera.qcom.so fails to load\n'
-    printf '        (missing library = black preview). Add it from your stock dump:\n'
-    printf '          vendor/lib64/libgui_vendor.so\n'
+    note "the V1UGS35M camera HAL needs it or camera.qcom.so fails to load"
+    note "(missing library = black preview). Add it from your stock dump:"
+    note "  vendor/lib64/libgui_vendor.so"
 fi
 
-cat <<EOF
+hdr "Next"
+cmd "source build/envsetup.sh && lunch ${DEVICE}-userdebug"
+cmd "mka bacon        # or: brunch $DEVICE"
 
-Next:
-  source build/envsetup.sh && lunch <device>-userdebug
-  mka bacon            # or brunch $DEVICE
+hdr "Watch the build log for"
+note "[PASS] .../Camera3OutputUtils.cpp: <n> shutter check(s), patched"
 
-Watch the build log for:
-  [PASS] .../Camera3OutputUtils.cpp: <n> shutter check(s), patched
+hdr "After flashing"
+cmd "adb shell sha1sum /vendor/lib64/hw/camera.qcom.so"
+note "must match the blob from your V1UGS35M dump"
+cmd "adb logcat -b all -d | grep -iE \"out-of-order|ERROR_BUFFER|CameraFsm\""
+note "no out-of-order lines while shooting in bright light = fixed"
 
-Then on device, after flashing:
-  adb shell sha1sum /vendor/lib64/hw/camera.qcom.so      # must match your dump
-  adb shell getprop | grep -iE "camera\\.(cfa|aux|expose)"
-  adb logcat -b all -d | grep -iE "out-of-order|ERROR_BUFFER|CameraFsm"
-
-Commit what this changed (both trees are dirty now):
-  ( cd device/motorola/$DEVICE && git add -A && git commit -m "fogos: inherit the Motorola camera tree" )
-  ( cd $CAM_DIR && git add -A && git commit -m "motocamera: apply the cameraserver shutter-order workaround" )
-
-EOF
+hdr "Commit what changed"
+cmd "( cd device/motorola/$DEVICE && git add -A && git commit -m \"fogos: inherit the Motorola camera tree\" )"
+cmd "( cd $CAM_DIR && git add -A && git commit -m \"motocamera: apply the cameraserver shutter-order workaround\" )"
+printf '\n'
